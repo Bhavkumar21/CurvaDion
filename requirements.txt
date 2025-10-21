@@ -1,0 +1,6 @@
+torch>=2.7.0
+numpy
+pyyaml
+tqdm
+wandb
+huggingface_hub
