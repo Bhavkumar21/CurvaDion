@@ -1,0 +1,46 @@
+# — Model —
+model_dim: 768
+n_layer: 12
+n_head: 6
+sequence_length: 1024
+
+# — Batching & Training —
+batch_size: 1024
+device_batch_size: 32
+num_iterations: 3000
+
+# — Learning‐rate schedule —
+warmup_ratio: 0.0
+warmdown_ratio: 0.2
+
+# — Optimizer & Hyperparameters —
+optimizer: diloco_dion
+scalar_opt: lion
+lr: 0.02
+rank_fraction: 0.125
+mu: 0.95
+weight_decay: 0.01
+
+# — DiLocoDion Specific —
+sync_every: 1  # Sync every step = standard DDP behavior (no communication reduction)
+
+# — Validation & Checkpointing —
+val_loss_every: 125
+val_tokens: 10485760
+checkpoint_freq: 0  # Disabled - no checkpointing
+
+# — Weights & Biases logging —
+wandb_project_name: curvadion-threshold-sensitivity
+wandb_job_name: baseline
+no_wandb: true  # Disabled due to network connectivity issues on compute nodes
+
+# — Distributed training —
+dp_size: null      # data‐parallel size (null = auto-detect)
+fs_size: null      # FSDP size (not used for DDP)
+tp_size: null      # tensor‐parallel size (not used for DDP)
+replicate_mesh_grad_sync: true  # REQUIRED: Let DiLocoDion control gradient sync
+
+# — Miscellaneous flags —
+debug: false
+no_compile: false
+mixed_precision: true

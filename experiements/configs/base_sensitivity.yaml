@@ -1,0 +1,46 @@
+# — Model —
+model_dim: 768
+n_layer: 12
+n_head: 6
+sequence_length: 1024
+
+# — Batching & Training —
+batch_size: 1024  # Will be overridden for batch size sweep
+device_batch_size: 32
+num_iterations: 3000
+
+# — Learning‐rate schedule —
+warmup_ratio: 0.0
+warmdown_ratio: 0.2
+
+# — Optimizer & Hyperparameters —
+optimizer: dion_simple  # Will be changed to curvadion for CurvaDion runs
+scalar_opt: lion
+lr: 0.02
+rank_fraction: 0.125  # Will be overridden for rank fraction sweep
+mu: 0.95
+weight_decay: 0.01
+
+# — CurvaDion Specific —
+rmmc_threshold: 0.1  # Only used when optimizer=curvadion
+
+# — Validation & Checkpointing —
+val_loss_every: 125
+val_tokens: 10485760
+checkpoint_freq: 0  # Disabled - no checkpointing
+
+# — Weights & Biases logging —
+wandb_project_name: curvadion-sensitivity  # Will be overridden
+wandb_job_name: default  # Will be overridden
+no_wandb: false
+
+# — Distributed training —
+dp_size: null      # data‐parallel size (null = auto-detect)
+fs_size: null      # FSDP size (not used for DDP)
+tp_size: null      # tensor‐parallel size (not used for DDP)
+replicate_mesh_grad_sync: true  # REQUIRED: Let optimizer control gradient sync
+
+# — Miscellaneous flags —
+debug: false
+no_compile: false
+mixed_precision: true
