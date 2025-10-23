@@ -14,18 +14,13 @@ RMMC_ℓ(t) = |‖M_ℓ(t)‖ - ‖M_ℓ(t-1)‖| / ‖M_ℓ(t-1)‖
 1. Calculate RMMC for each layer
 2. All-reduce a boolean flag: does any GPU need sync? **(4 bytes)**
 3. If `max(RMMC) > threshold`: Full gradient sync
-4. Else: Local updates only (models diverge slightly, reconverge at next sync)
+4. Else: Local updates only
 
 ## Communication Savings
 
 **Per step communication:**
 - **Stable training** (RMMC < threshold): **4 bytes** (just the flag)
 - **Unstable training** (RMMC > threshold): **4 bytes + gradient all-reduces**
-
-**Compared to standard DDP:**
-- Standard DDP: Gradient all-reduce every step
-- CurvaDion: Gradient all-reduce only when needed
-
 
 ## Installation
 
@@ -60,12 +55,6 @@ replicate_mesh_grad_sync: true   # REQUIRED: Disables DDP auto-sync, lets optimi
 
 **⚠️ IMPORTANT:** `replicate_mesh_grad_sync: true` is **required** for CurvaDion to work correctly. Without it, PyTorch DDP will automatically synchronize gradients every step, making CurvaDion's adaptive sync mechanism meaningless.
 
-### Tuning `rmmc_threshold`
-
-- **Too low (< 0.05)**: Syncs too often, minimal communication savings
-- **Too high (> 0.3)**: Models may diverge, poor convergence
-- **Sweet spot:** 0.1 - 0.2
-
 ## Tracked Metrics
 
 CurvaDion automatically tracks and logs:
@@ -76,47 +65,3 @@ CurvaDion automatically tracks and logs:
 - `curvadion/recent_bytes`: Bytes transferred in last step
 - `curvadion/total_bytes_MB`: Total communication in MB
 - `curvadion/avg_bytes_per_step`: Average bytes per step
-
-## Implementation Details
-
-### DDP-Only Design
-
-This implementation is **simplified for DDP only** (no FSDP/TP support). Key design choices:
-
-1. **Natural reconvergence**: No special divergence correction, models naturally reconverge
-2. **Static threshold**: Single hyperparameter throughout training
-3. **Boolean flag only**: Minimal overhead for sync decision
-4. **Byte tracking**: Precise accounting of all communication
-
-### Optimizer Structure
-
-- **`curvadion.py`**: Main adaptive optimizer
-  - Tracks momentum norms per layer
-  - Calculates RMMC each step
-  - Routes to sync or local update
-  - Tracks bytes transferred
-
-- **`dion_simple.py`**: Used for local updates (0 communication)
-
-- **`scalar_opts.py`**: AdamW/Lion for non-matrix parameters
-
-
-## Directory Structure
-
-```
-CurvaDion/
-├── optimizers/
-│   ├── curvadion.py           # Adaptive communication optimizer
-│   ├── dion_simple.py         # Local Dion updates
-│   ├── dion.py                # Full Dion (not used)
-│   ├── scalar_opts.py         # AdamW/Lion
-│   └── opt_utils.py           # Utilities
-├── models/
-│   ├── gpt_model.py           # GPT architecture
-│   └── gpt_utils.py           # Data loaders
-├── configs/
-│   └── curvadion_160m.yaml    # Config file
-├── train.py                   # Training script
-├── requirements.txt
-└── README.md
-```

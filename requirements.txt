@@ -4,3 +4,4 @@ pyyaml
 tqdm
 wandb
 huggingface_hub
+hf_transfer

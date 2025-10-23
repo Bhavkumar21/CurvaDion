@@ -1,530 +1,41 @@
-import argparse
+"""
+Main training script for CurvaDion.
+"""
+
 import math
 import os
-import shutil
 import time
-import tempfile
 import torch
 import torch.distributed as dist
-import torch.distributed.checkpoint as dcp
 import wandb
-import yaml
 
-from dataclasses import dataclass
-from pathlib import Path
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
-from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule
-from torch.distributed.tensor import DeviceMesh
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
-from typing import Optional
 
 from models.gpt_model import GPT, GPTConfig
 from models.gpt_utils import DistributedDataLoader
-from optimizers import CurvaDion, DionSimple, DiLocoDion, DionMixedPrecisionConfig
+from optimizers import CurvaDion
 
-
-@dataclass
-class Hyperparameters:
-    # Data directory
-    data_dir: str = "data/fineweb10B"
-
-    # Training config
-    batch_size: int = 8 * 64  # global batch size (across devices)
-    device_batch_size: int = 64  # per-device batch size
-    sequence_length: int = 1024  # tokens per sequence
-    num_iterations: int = 5000
-    warmup_ratio: float = 0.01
-    warmdown_ratio: float = 0.2
-
-    # Model config
-    model_dim: int = 768
-    n_layer: int = 12
-    n_head: int = 6
-
-    # Evaluation and logging
-    val_loss_every: int = 125
-    val_tokens: int = 10485760
-    checkpoint_freq: int = 0
-    checkpoint_dir: str = None
-    wandb_project_name: str = "dion-test"
-
-    # Optimizer
-    optimizer: str = "dion"
-    scalar_opt: str = "lion"
-
-    # Main optimizer hyperparameters
-    lr: float = 0.02
-    mu: float = 0.95
-    weight_decay: float = 0.01
-    rank_fraction: float = 0.125
-
-    # Optimizer specific hyperparameters
-    qr_method: str = "rcqr"
-    cqr_warmup: float = 0.05
-    rcqr_oversample: float = 1.25
-    replicate_mesh_grad_sync: bool = False
-    mixed_precision: bool = False
-    adjust_lr: str = "spectral_norm"  # for Muon only
-    rmmc_threshold: float = 0.1  # for CurvaDion only
-    sync_every: int = 50  # for DiLocoDion only
-
-
-# Helper function to only print on global rank 0
-MASTER_PROCESS = True
-
-
-def print0(*args):
-    if MASTER_PROCESS:
-        print(*args)
-
-
-def parse_cli_args():
-    # --- Command-line argument parsing ---
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config",
-        type=str,
-        help="Path to a YAML file whose keys match train.py flags "
-        "(CLI values always override the YAML).",
-    )
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default=None,
-        help="Directory that contains fineweb_train_*.bin and fineweb_val_*.bin",
-    )
-    parser.add_argument(
-        "--checkpoint_dir",
-        type=str,
-        default=None,
-        help="Directory to load and save checkpoints",
-    )
-    parser.add_argument(
-        "--checkpoint_freq",
-        type=int,
-        default=None,
-        help="Checkpoint every N steps, 0 to disable",
-    )
-
-    # ---------- optimizer ----------
-    parser.add_argument(
-        "--optimizer", type=str, default=None, help="Choice of optimizer algorithm"
-    )
-    parser.add_argument(
-        "--scalar_opt", type=str, help="Optimizer for scalar parameters", default=None
-    )
-    parser.add_argument("--lr", type=float, default=None, help="Base learning rate")
-    parser.add_argument(
-        "--adjust_lr",
-        type=str,
-        default=None,
-        help="Adjust learning rate method for Muon",
-    )
-    parser.add_argument(
-        "--inv_rank_fraction",
-        type=int,
-        default=None,
-        help="1/r rank fraction for Dion",
-    )
-    parser.add_argument(
-        "--qr_method", type=str, default=None, choices=["qr", "cqr", "rcqr"]
-    )
-    parser.add_argument(
-        "--mixed_precision", action="store_true", help="Use mixed precision for Dion"
-    )
-    parser.add_argument(
-        "--sync_every", type=int, default=None, help="Sync every N steps for DiLocoDion"
-    )
-
-    # ---------- model ----------
-    parser.add_argument("--model_dim", type=int, default=None)
-    parser.add_argument("--n_layer", type=int, default=None)
-    parser.add_argument("--n_head", type=int, default=None)
-
-    # ---------- training hyperparameters ----------
-    parser.add_argument(
-        "--num_iterations", type=int, default=None, help="Number of training steps"
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=None, help="Global batch size"
-    )
-    parser.add_argument("--device_batch_size", type=int, default=None)
-    parser.add_argument("--sequence_length", type=int, default=None)
-    parser.add_argument("--warmup_ratio", type=float, default=None)
-    parser.add_argument("--warmdown_ratio", type=float, default=None)
-
-    # ---------- wandb logging ----------
-    parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
-    parser.add_argument(
-        "--wandb_project_name", type=str, default=None, help="Wandb project name"
-    )
-    parser.add_argument(
-        "--wandb_job_name",
-        type=str,
-        default=None,
-        help="Append custom text to wandb job name",
-    )
-
-    # ---------- distributed training ----------
-    parser.add_argument(
-        "--dp_size", type=int, default=None, help="Data Parallel size (no sharding)"
-    )
-    parser.add_argument(
-        "--fs_size", type=int, default=None, help="Fully Sharded Data Parallel size"
-    )
-    parser.add_argument(
-        "--tp_size", type=int, default=None, help="Tensor Parallel size"
-    )
-    parser.add_argument(
-        "--replicate_mesh_grad_sync",
-        action="store_true",
-        help="Do data-parallel gradient sync inside Dion optimizer",
-    )
-    parser.add_argument(
-        "--fast_fsdp",
-        action="store_true",
-        help="Optimizer FSDP for speed instead of memory efficiency",
-    )
-
-    # ---------- debugging ----------
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
-    parser.add_argument(
-        "--curvadion_debug", action="store_true", help="Enable detailed RMMC debug printing for CurvaDion"
-    )
-    parser.add_argument(
-        "--no_compile", action="store_true", help="Disable torch.compile for model"
-    )
-    parser.add_argument(
-        "--no_triton", action="store_true", help="Disable Triton kernels"
-    )
-
-    cli_args = parser.parse_args()
-    if cli_args.config:
-        # Read YAML → dict
-        cfg_path = Path(cli_args.config)
-        with cfg_path.open("r") as f:
-            yaml_cfg = yaml.safe_load(f)
-
-        # Copy any key the user did NOT supply on the CLI
-        for k, v in yaml_cfg.items():
-            if getattr(cli_args, k, None) is None:
-                setattr(cli_args, k, v)
-
-        # We need to manually handle store_true flags
-        for flag in (
-            "mixed_precision",
-            "replicate_mesh_grad_sync",
-            "fast_fsdp",
-            "no_wandb",
-            "no_compile",
-            "no_triton",
-            "debug",
-        ):
-            if yaml_cfg.get(flag, False):
-                setattr(cli_args, flag, True)
-
-    return cli_args
-
-
-def override_args_from_cli(
-    hp: Hyperparameters, cli_args: argparse.Namespace
-) -> Hyperparameters:
-    for key, value in vars(cli_args).items():
-        if value is not None:
-            if hasattr(hp, key):
-                print0(f"Setting hyperparameter {key}={value}")
-                setattr(hp, key, value)
-    return hp
-
-
-def init_distributed(dp_size, fs_size, tp_size) -> Optional[DeviceMesh]:
-    """
-    Initialize DeviceMesh or ProcessGroup for distributed training.
-    If all mesh dimensions are None, we default to using DDP.
-    """
-    assert torch.cuda.is_available(), "CUDA must be available"
-    assert torch.distributed.is_available(), "Distributed must be available"
-
-    # Check that environment variables are set
-    assert all(
-        var in os.environ for var in ["RANK", "LOCAL_RANK", "WORLD_SIZE"]
-    ), "This script must be launched using the 'torchrun' command."
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-
-    # Set global master process flag
-    global MASTER_PROCESS
-    MASTER_PROCESS = rank == 0
-
-    mesh_dims = (dp_size, fs_size, tp_size)
-    if all(d is None for d in mesh_dims):
-        # If no mesh dimensions given, initialize process group for DDP
-        device_mesh = None
-        dist.init_process_group(backend="nccl")
-        device = f"cuda:{local_rank}"
-        torch.cuda.set_device(device)
-
-        print0("=" * 80)
-        print0("Distributed training initialized with DDP")
-        print0(f"World size: {world_size}")
-
-    else:
-        # Use device mesh for distributed training
-        # All mesh dimensions must be specified
-        assert all(
-            d is not None for d in mesh_dims
-        ), f"All mesh dimensions (dp_size, fs_size, tp_size) must be specified, but got ({dp_size}, {fs_size}, {tp_size})"
-
-        # Check if we have the right number of GPUs
-        total_gpus = dp_size * fs_size * tp_size
-        assert world_size == total_gpus, (
-            f"World size {world_size} does not match expected size {total_gpus} "
-            f"(DP {dp_size}, FS {fs_size}, TP {tp_size})"
-        )
-        device_mesh = init_device_mesh(
-            device_type="cuda",
-            mesh_shape=(dp_size, fs_size, tp_size),
-            mesh_dim_names=("dp", "fs", "tp"),
-        )
-
-        print0("=" * 80)
-        print0("Distributed training initialized with DeviceMesh")
-        print0(f"World size: {world_size}")
-        print0(f"DP size: {dp_size}")
-        print0(f"FS size: {fs_size}")
-        print0(f"TP size: {tp_size}")
-        print0(device_mesh)
-
-    return device_mesh
-
-
-def init_optimizer(
-    model: GPT,
-    device_mesh: Optional[DeviceMesh],
-    ddp_model: Optional[DDP],
-    hp: Hyperparameters,
-    cli_args: argparse.Namespace,
-):
-    # Check that we have a valid scalar optimizer
-    if hp.scalar_opt not in ["adamw", "lion"]:
-        raise ValueError(f"Unrecognized scalar optimizer: {hp.scalar_opt}")
-
-    # Separate the model's parameters based on their types
-    matrix_params = list(model.transformer.h.parameters())
-    embedding_params = list(model.transformer.wte.parameters())
-    lm_head_params = list(model.lm_head.parameters())
-
-    # Matrix params use optimizer default settings
-    param_groups = [dict(params=matrix_params)]
-
-    # Add additional param groups with the necessary configurations for scalar params
-    param_groups.append(
-        dict(
-            params=embedding_params,
-            algorithm=hp.scalar_opt,
-            lr=hp.lr,  # no LR adjustment for embedding parameters
-            betas=(0.95, 0.98),
-            weight_decay=0,  # no weight decay for embedding parameters
-        )
-    )
-    param_groups.append(
-        dict(
-            params=lm_head_params,
-            algorithm=hp.scalar_opt,
-            lr=hp.lr / math.sqrt(hp.model_dim),  # scale LR for lm_head
-            betas=(0.95, 0.98),
-            weight_decay=0,  # no weight decay for lm_head parameters
-        )
-    )
-
-    # Simplified for DDP only
-    assert ddp_model is not None, "This implementation only supports DDP mode"
-    process_group = ddp_model.process_group
-
-    # CurvaDion and DiLocoDion REQUIRE replicate_mesh_grad_sync=True to work correctly
-    # Without it, DDP will sync gradients automatically, making the optimizer's sync schedule meaningless
-    if hp.optimizer in ["curvadion", "diloco_dion"]:
-        if not hp.replicate_mesh_grad_sync:
-            raise ValueError(
-                f"{hp.optimizer} requires replicate_mesh_grad_sync=True to function correctly.\n"
-                f"Without it, PyTorch DDP will sync gradients every step automatically,\n"
-                f"making the optimizer's adaptive/scheduled sync mechanism meaningless.\n"
-                f"Please add 'replicate_mesh_grad_sync: true' to your config file."
-            )
-
-    if hp.mixed_precision:
-        dion_mixed_precision_config = DionMixedPrecisionConfig(
-            momentum_dtype=torch.bfloat16,
-            variance_dtype=torch.bfloat16,
-            Q_dtype=torch.bfloat16,
-        )
-    else:
-        dion_mixed_precision_config = None
-
-    if hp.optimizer == "curvadion":
-        print0(f"CurvaDion rank fraction: {hp.rank_fraction}")
-        print0(f"CurvaDion RMMC threshold: {hp.rmmc_threshold}")
-        print0(f"CurvaDion mixed precision: {hp.mixed_precision}")
-        print0(f"CurvaDion debug: {cli_args.curvadion_debug}")
-        opt = CurvaDion(
-            param_groups,
-            process_group=process_group,
-            rmmc_threshold=hp.rmmc_threshold,
-            track_metrics=True,
-            debug=cli_args.curvadion_debug,
-            lr=hp.lr,
-            mu=hp.mu,
-            rank_fraction=hp.rank_fraction,
-            weight_decay=hp.weight_decay,
-            mixed_precision_config=dion_mixed_precision_config,
-        )
-
-    elif hp.optimizer == "dion_simple":
-        print0(f"DionSimple rank fraction: {hp.rank_fraction}")
-        print0(f"DionSimple mixed precision: {hp.mixed_precision}")
-        opt = DionSimple(
-            param_groups,
-            lr=hp.lr,
-            mu=hp.mu,
-            weight_decay=hp.weight_decay,
-            rank=round(hp.rank_fraction * hp.model_dim),
-            mixed_precision_config=dion_mixed_precision_config,
-        )
-
-    elif hp.optimizer == "diloco_dion":
-        print0(f"DiLocoDion rank fraction: {hp.rank_fraction}")
-        print0(f"DiLocoDion sync every: {hp.sync_every}")
-        print0(f"DiLocoDion mixed precision: {hp.mixed_precision}")
-        opt = DiLocoDion(
-            param_groups,
-            process_group=process_group,
-            sync_every=hp.sync_every,
-            track_metrics=True,
-            debug=False,
-            lr=hp.lr,
-            mu=hp.mu,
-            rank_fraction=hp.rank_fraction,
-            weight_decay=hp.weight_decay,
-            mixed_precision_config=dion_mixed_precision_config,
-        )
-
-    else:
-        raise ValueError(f"Unsupported optimizer: {hp.optimizer}. Only 'curvadion', 'dion_simple', and 'diloco_dion' are supported.")
-
-    return opt
-
-
-class CheckpointManager:
-    def __init__(
-        self,
-        checkpoint_dir: str,
-        model: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
-        train_loader: DistributedDataLoader,
-        val_loader: DistributedDataLoader,
-        wandb_id: Optional[str] = None,
-    ):
-        self.checkpoint_dir = checkpoint_dir
-        self.model = model
-        self.optimizer = optimizer
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.wandb_id = wandb_id
-        self.step = None
-        self.DEFAULT_NAME = "checkpoint"
-
-    def _get_state_dict(self) -> dict:
-        # Use get_state_dict() instead of directly calling model.state_dict() etc.
-        # This standardizes state dict for model and optimizer regardless of sharding
-        model_state, opt_state = get_state_dict(self.model, self.optimizer)
-        state_dict = {
-            "model": model_state,
-            "optimizer": opt_state,
-            "train_loader": self.train_loader.state_dict(),
-            "val_loader": self.val_loader.state_dict(),
-            "step": self.step,
-            "wandb_id": self.wandb_id,
-        }
-        return state_dict
-
-    def save(self, name: Optional[str] = None, step: Optional[int] = None):
-        """
-        Save the checkpoint to the path "self.checkpoint_dir/name/".
-        The distributed checkpoint is a directory with sharded files.
-        It must reside on a shared filesystem accessible by all processes.
-        """
-        assert self.checkpoint_dir, "Checkpoint directory must be specified"
-        self.step = step
-        name = name or self.DEFAULT_NAME
-        checkpoint_path = os.path.join(self.checkpoint_dir, name)
-        print0(f"Saving checkpoint to {checkpoint_path}")
-
-        # Save to a temporary subdirectory first
-        tmpdir = None
-        if dist.get_rank() == 0:
-            os.makedirs(self.checkpoint_dir, exist_ok=True)
-            tmpdir = tempfile.mkdtemp(dir=self.checkpoint_dir)
-
-        # Broadcast tmpdir from rank 0 to all ranks
-        obj_list = [tmpdir]
-        dist.broadcast_object_list(obj_list, src=0)
-        tmpdir = obj_list[0]
-
-        # Save the checkpoint
-        state_dict = self._get_state_dict()
-        dcp.save(state_dict, checkpoint_id=tmpdir)
-        dist.barrier()
-
-        if dist.get_rank() == 0:
-            # Delete any existing checkpoint with the same name
-            if os.path.isfile(checkpoint_path):
-                os.remove(checkpoint_path)
-            elif os.path.isdir(checkpoint_path):
-                shutil.rmtree(checkpoint_path, ignore_errors=True)
-            # Move the checkpoint to the final location
-            shutil.move(tmpdir, checkpoint_path)
-        dist.barrier()
-
-    def load(self, name: Optional[str] = None, allow_missing: bool = False):
-        """
-        Load the checkpoint from the path "self.checkpoint_dir/name/".
-        """
-        assert self.checkpoint_dir, "Checkpoint directory must be specified"
-        name = name or self.DEFAULT_NAME
-        checkpoint_path = os.path.join(self.checkpoint_dir, name)
-
-        if not os.path.isdir(checkpoint_path):
-            if allow_missing:
-                print0(f"Checkpoint {checkpoint_path} does not exist, skipping load")
-                return
-            raise FileNotFoundError(f"Checkpoint {checkpoint_path} does not exist")
-
-        print0(f"Loading checkpoint from {checkpoint_path}")
-        state_dict = self._get_state_dict()
-        dcp.load(state_dict, checkpoint_id=checkpoint_path)
-
-        # Load model and optimizer state dicts
-        set_state_dict(
-            self.model,
-            self.optimizer,
-            model_state_dict=state_dict["model"],
-            optim_state_dict=state_dict["optimizer"],
-        )
-
-        # Load train and validation dataloader states
-        self.train_loader.load_state_dict(state_dict["train_loader"])
-        self.val_loader.load_state_dict(state_dict["val_loader"])
-
-        self.step = state_dict["step"]
-        self.wandb_id = state_dict["wandb_id"]
-        dist.barrier()
+from utils import (
+    Hyperparameters,
+    print0,
+    parse_cli_args,
+    override_args_from_cli,
+    init_distributed,
+    init_optimizer,
+    get_lr_schedule_fn,
+    CheckpointManager,
+    JSONLogger,
+    save_initialization,
+    load_initialization,
+)
 
 
 def main():
+    """Main training function."""
     torch._dynamo.config.cache_size_limit = 100
+
     # --- Parse command line arguments and set hyperparams ---
     cli_args = parse_cli_args()
     hp = Hyperparameters()
@@ -533,7 +44,8 @@ def main():
     if cli_args.inv_rank_fraction:
         hp.rank_fraction = 1.0 / cli_args.inv_rank_fraction
 
-    if hp.checkpoint_freq > 0:
+    # Only check for checkpoint_dir if we're actually going to train (not just saving init)
+    if hp.checkpoint_freq > 0 and not cli_args.save_init:
         if not hp.checkpoint_dir:
             raise ValueError("Must specify --checkpoint_dir to save checkpoints")
 
@@ -633,6 +145,7 @@ def main():
     # If replicate_mesh_grad_sync is True, FSDP will not handle data-parallel gradient sync
     # If replicate_mesh_grad_sync is False, we use Pytorch HSDP to do data-parallel gradient sync
     if device_mesh is not None:
+        from models.gpt_model import parallelize_gpt_model
         parallelize_gpt_model(
             model,
             device_mesh=device_mesh,
@@ -643,19 +156,58 @@ def main():
         )
         raw_model = model
 
-    # Move model to GPU
+    # Move model to GPU and initialize weights
     model.to_empty(device="cuda")
     model.init_weights()
+
+    # --- Handle initialization load BEFORE wrapping/compilation ---
+    # IMPORTANT: Load initialization before DDP wrapping to ensure all ranks start with identical weights
+    # If we load after DDP init, DDP will broadcast rank 0's random weights first, defeating the purpose
+    if cli_args.init_from:
+        load_initialization(model if device_mesh is not None else model, cli_args.init_from)
+        # Broadcast parameters from rank 0 to ensure perfect synchronization across all ranks
+        if device_mesh is None:
+            # For DDP, broadcast all parameters from rank 0
+            for param in model.parameters():
+                dist.broadcast(param.data, src=0)
+        print0("Initialization loaded and synchronized across all ranks")
+
+    # --- Handle initialization save (if requested) ---
+    # Save initialization before compilation and DDP wrapping to get clean weights
+    if cli_args.save_init:
+        save_initialization(model if device_mesh is not None else model, cli_args.save_init)
+        print0(f"Initialization saved. Exiting as this was just for saving init.")
+        dist.destroy_process_group()
+        return
+
+    # Compile model after initialization is loaded
     if not cli_args.no_compile:
         model.compile()
 
     # If no device mesh, we are using DDP
     if device_mesh is None:
-        # Use LOCAL_RANK here (per-node GPU index)
-        # This ensures each process is pinned to the correct local GPU
-        local_rank = int(os.environ["LOCAL_RANK"])
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-        raw_model = model.module  # the underlying model
+        # CRITICAL: For DiLoCo with replicate_mesh_grad_sync=True, DO NOT use DDP!
+        # DiLoCo handles ALL synchronization through the optimizer.
+        # DDP interferes with this by synchronizing gradients, preventing divergence.
+        use_ddp = not (hp.optimizer == "diloco_dion" and hp.replicate_mesh_grad_sync)
+
+        if use_ddp:
+            # Use LOCAL_RANK here (per-node GPU index)
+            local_rank = int(os.environ["LOCAL_RANK"])
+            # Wrap in DDP with broadcast_buffers=False to prevent unintended synchronization
+            # This is critical for CurvaDion to control synchronization schedule
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                broadcast_buffers=False,  # Prevent automatic buffer sync during forward
+            )
+            raw_model = model.module  # the underlying model
+            print0("Using DDP for gradient synchronization")
+        else:
+            # No DDP - optimizer handles all synchronization
+            raw_model = model
+            print0(f"NOT using DDP - {hp.optimizer} optimizer handles all synchronization")
 
     # Ensure parameters are contiguous
     for i, p in enumerate(model.parameters()):
@@ -675,31 +227,35 @@ def main():
     print0(f"Scalar optimizer: {hp.scalar_opt}")
     print0(f"Base learning rate: {hp.lr}")
 
+    # For optimizer initialization, we need the process group
+    # If using DDP, get it from DDP model; otherwise get the default process group
+    if isinstance(model, DDP):
+        ddp_model_for_opt = model
+    elif device_mesh is None:
+        # No device mesh and not using DDP - create a reference that has process_group attribute
+        # This is for diloco_dion which needs process_group but doesn't use DDP
+        class _ProcessGroupHolder:
+            def __init__(self):
+                self.process_group = dist.group.WORLD
+        ddp_model_for_opt = _ProcessGroupHolder()
+    else:
+        ddp_model_for_opt = None
+
     optimizer = init_optimizer(
         model=raw_model,
         device_mesh=device_mesh,
-        ddp_model=model if isinstance(model, DDP) else None,
+        ddp_model=ddp_model_for_opt,
         hp=hp,
         cli_args=cli_args,
     )
 
     # Learning rate scheduler
-    def get_lr(it):
-        warmup_iters = round(hp.warmup_ratio * hp.num_iterations)
-        warmdown_iters = round(hp.warmdown_ratio * hp.num_iterations)
-        if it < warmup_iters:
-            return (it + 1) / warmup_iters
-        elif it <= hp.num_iterations - warmdown_iters:
-            return 1.0
-        else:
-            return (hp.num_iterations - it) / warmdown_iters
-
+    get_lr = get_lr_schedule_fn(hp)
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
     print0("=" * 80)
 
     # --- Logging initialization ---
-    # Load hyperparameters and update with CLI arguments
     # Create a name to identify this run
     run_name = f"({hp.optimizer}+{hp.scalar_opt})"
     if "dion" in hp.optimizer:
@@ -742,7 +298,8 @@ def main():
     # --- WandB initialization ---
     if not cli_args.no_wandb and not cli_args.debug:
         assert hp.wandb_project_name, "wandb project name is required"
-        if MASTER_PROCESS:
+        import utils.config
+        if utils.config.MASTER_PROCESS:
             # Check if we already have a wandb ID from the checkpoint
             wandb_id = checkpoint_manager.wandb_id
             resume = "must" if wandb_id else "never"
@@ -767,6 +324,11 @@ def main():
         dist.broadcast_object_list(obj_list, src=0)
         checkpoint_manager.wandb_id = obj_list[0]
 
+    # --- JSON Logger initialization ---
+    json_logger = None
+    if cli_args.json_log_dir:
+        json_logger = JSONLogger(cli_args.json_log_dir, run_name)
+
     # --- Training Loop ---
     x, y = train_loader.next_batch()
     training_time_ms = 0
@@ -776,9 +338,11 @@ def main():
     # Use autocast for mixed precision
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
+    import utils.config
     start_step = 0 if checkpoint_manager.step is None else checkpoint_manager.step + 1
-    pbar = tqdm(total=hp.num_iterations, desc="Training", disable=not MASTER_PROCESS)
+    pbar = tqdm(total=hp.num_iterations, desc="Training", disable=not utils.config.MASTER_PROCESS)
     pbar.update(start_step)
+
     for step in range(start_step, hp.num_iterations + 1):
         # Skip the first few steps for timing to avoid torch.compile overhead
         if step == 10:
@@ -814,15 +378,16 @@ def main():
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps):.2f}ms"
             )
             print0(log_message)
-            if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
-                wandb.log(
-                    {
-                        "val/loss": val_loss,
-                        "val/perplexity": val_perplexity,
-                        "step": step,
-                        "time/training_time_ms": training_time_ms,  # Log total elapsed training time in ms
-                    }
-                )
+            val_metrics = {
+                "val/loss": val_loss,
+                "val/perplexity": val_perplexity,
+                "step": step,
+                "time/training_time_ms": training_time_ms,  # Log total elapsed training time in ms
+            }
+            if utils.config.MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
+                wandb.log(val_metrics)
+            if json_logger:
+                json_logger.log(val_metrics)
             pbar.set_postfix(val_loss=f"{val_loss:.4f}")
 
             # Restart training time for the next iteration
@@ -840,23 +405,29 @@ def main():
             loss = loss / grad_accum_steps
             x, y = train_loader.next_batch()
 
-            # Turn off DDP grad sync if replicate_mesh_grad_sync is True
-            ddp_no_sync = i < grad_accum_steps or hp.replicate_mesh_grad_sync
-            if isinstance(model, DDP) and ddp_no_sync:
-                with model.no_sync():
+            # Handle backward pass based on model type
+            if isinstance(model, DDP):
+                # Turn off DDP grad sync if replicate_mesh_grad_sync is True
+                ddp_no_sync = i < grad_accum_steps or hp.replicate_mesh_grad_sync
+                if ddp_no_sync:
+                    with model.no_sync():
+                        loss.backward()
+                else:
                     loss.backward()
+            elif isinstance(model, FSDPModule):
+                # Gradient accumulation for DP on top of FSDP
+                model.set_is_last_backward(i == grad_accum_steps)
+                if cli_args.fast_fsdp:
+                    # Only reshard and reduce-scatter gradients upon the last backward pass
+                    # Keep the entire unsharded model in memory during gradient accumulation
+                    model.set_reshard_after_backward(i == grad_accum_steps)
+                    model.set_requires_gradient_sync(i == grad_accum_steps)
+                else:
+                    # FSDP always synchronizes sharded gradients via reduce-scatter
+                    model.set_requires_gradient_sync(True)
+                loss.backward()
             else:
-                if isinstance(model, FSDPModule):
-                    # Gradient accumulation for DP on top of FSDP
-                    model.set_is_last_backward(i == grad_accum_steps)
-                    if cli_args.fast_fsdp:
-                        # Only reshard and reduce-scatter gradients upon the last backward pass
-                        # Keep the entire unsharded model in memory during gradient accumulation
-                        model.set_reshard_after_backward(i == grad_accum_steps)
-                        model.set_requires_gradient_sync(i == grad_accum_steps)
-                    else:
-                        # FSDP always synchronizes sharded gradients via reduce-scatter
-                        model.set_requires_gradient_sync(True)
+                # No DDP/FSDP - just do backward (optimizer handles sync)
                 loss.backward()
 
         # Gradient norm
@@ -894,19 +465,16 @@ def main():
                 "curvadion/avg_bytes_per_step": metrics.get("avg_bytes_per_step", 0),
             })
 
-        # Add DiLocoDion metrics if using DiLocoDion optimizer
-        if hp.optimizer == "diloco_dion" and isinstance(optimizer, DiLocoDion):
-            metrics = optimizer.get_metrics()
-            log_dict.update({
-                "diloco_dion/sync_rate": metrics.get("sync_rate", 0.0),
-                "diloco_dion/recent_bytes": metrics.get("recent_bytes", 0),
-                "diloco_dion/total_bytes_MB": metrics.get("total_bytes_transferred", 0) / (1024 * 1024),
-                "diloco_dion/avg_bytes_per_step": metrics.get("avg_bytes_per_step", 0),
-            })
+        # Add DiLoCo metrics if using DiLoCoWrapper optimizer
+        if hp.optimizer == "diloco_dion" and hasattr(optimizer, "get_metrics"):
+            diloco_metrics = optimizer.get_metrics()
+            log_dict.update(diloco_metrics)
 
-        if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
+        if utils.config.MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
             wandb.log(log_dict)
-        if MASTER_PROCESS and cli_args.debug:
+        if json_logger:
+            json_logger.log(log_dict)
+        if utils.config.MASTER_PROCESS and cli_args.debug:
             print0(
                 f"Step {step}: train_loss={train_loss.item():.4f}, train_ppl={train_perplexity:.2f}, grad_norm={grad_norm.item():.4f}"
             )
@@ -931,6 +499,11 @@ def main():
     print0(
         f"Peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB"
     )
+
+    # Finalize JSON logger
+    if json_logger:
+        json_logger.close()
+
     dist.destroy_process_group()
 
 
