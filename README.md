@@ -1,6 +1,6 @@
-# CurvaDion: Adaptive Communication Optimizer
+# CurvaDion: Curvature-Adaptive Distributed Orthonormalization
 
-**CurvaDion** is an adaptive communication optimizer for distributed training that reduces synchronization overhead by only syncing when momentum changes significantly.
+**CurvaDion** is an adaptive communication optimizer for distributed training that reduces synchronization overhead by only syncing when needed.
 
 ## Key Innovation
 
